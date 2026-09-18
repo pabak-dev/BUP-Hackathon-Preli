@@ -1,236 +1,360 @@
-# GridWise: LLM-assisted campus energy optimization
+# GridWise
 
-One FastAPI service interprets operator notes with a real hosted model, validates the extracted directives, solves a 24-hour linear program, and independently replays the returned schedule. There is no frontend and no sample-specific production logic.
+Backend-only submission for the **BUP CSE Fest 2026 Preliminary Hackathon**.
 
-## Quickstart (Python 3.13)
+GridWise accepts a 24-hour campus energy scenario plus natural-language operator notes, interprets each note with a hosted LLM, validates the extracted directives, solves the minimum-cost schedule with linear programming, and independently replays the final plan before returning it.
 
-Obtain this repository using the GitHub URL supplied with the submission, then open a terminal in its root. A Git remote has not yet been configured in this working copy; the team must provide the repository URL before submission. Python 3.13 is the tested version and matches the locked dependencies and Docker runtime.
+## Submission
 
-Windows PowerShell:
+- **Public API:** `http://103.174.50.194:8000`
+- **Health:** `http://103.174.50.194:8000/health`
+- **Repository:** `https://github.com/pabak-dev/BUP-Hackathon-Preli`
+- **Docker image:** `pabakdev/gridwise:preli-v1`
+- **Docker digest:** `sha256:c618fb3b63f263ae75c26edab1b09a35a8b7ccedb1b3f422f46ee8fd45c80add`
+
+### Deployed verification
+
+The public VPS deployment was tested against all 10 organizer-provided public cases:
+
+```text
+Passed: 10 / 10
+p95 latency: 1.749 s
+```
+
+All 10 requests returned HTTP 200 and passed directive, replay, and optimal-cost checks.
+
+---
+
+## Architecture
+
+```text
+Request
+  -> strict request validation
+  -> LLM interpretation
+       Vertex AI
+         -> Groq fallback
+           -> Google AI Studio fallback
+  -> deterministic directive validation
+  -> LP optimizer
+  -> independent schedule replay
+  -> response
+```
+
+### LLM provider order
+
+1. **Google Vertex AI** — `gemini-3.8-flash`
+2. **Groq** — `openai/gpt-oss-120b`
+3. **Google AI Studio** — `gemini-3.5-flash-lite`
+
+Each configured provider is attempted at most once. Provider failures such as timeout, HTTP 429/5xx, refusal, malformed JSON, or invalid structured output immediately fall through to the next configured provider.
+
+There is no application-side rate limiter, request pacing, retry sleep, or throttling queue.
+
+### Language handling
+
+The LLM handles natural-language understanding. Deterministic code validates the resulting structure and numeric safety rather than trying to re-interpret operator language with regexes.
+
+This keeps the system tolerant of paraphrases and multilingual wording while still enforcing a strict directive schema.
+
+Supported directives:
+
+| Directive                 | Adjustment                                    |
+| ------------------------- | --------------------------------------------- |
+| `solar_reduction`         | `{"hours":[...],"factor":number}`             |
+| `minimum_battery_reserve` | `{"hours":[...],"minimum_energy_kwh":number}` |
+| `no_charge_window`        | `{"hours":[...]}`                             |
+| `no_discharge_window`     | `{"hours":[...]}`                             |
+| `max_grid_window`         | `{"hours":[...],"max_grid_kwh":number}`       |
+| `no_op`                   | `null`                                        |
+
+Guardrails enforce note ordering, valid directive type, exact adjustment shape, no extra fields, correct `applies` semantics, sorted unique hours in `0..23`, finite numeric values, valid solar factors, and reserve bounds.
+
+---
+
+## Optimization
+
+The schedule is solved with SciPy HiGHS:
+
+```python
+scipy.optimize.linprog(method="highs-ds")
+```
+
+Objective:
+
+```text
+minimize sum(grid[h] * tariff[h])
+```
+
+Core constraints:
+
+```text
+grid[h] + solar_used[h] + discharge[h]
+    = demand[h] + charge[h]
+
+energy[h]
+    = energy[h-1] + charge[h] - discharge[h]
+
+energy[23] = initial_energy
+```
+
+The optimizer also enforces:
+
+- battery capacity and minimum reserve
+- hourly charge/discharge limits
+- solar availability after active reductions
+- no-charge / no-discharge windows
+- active grid caps
+- nonnegative grid import
+- no grid export
+- final battery neutrality
+
+`app/validator.py` independently reconstructs the active constraints from the original request and validated directives, then replays the final 24-hour schedule. HTTP 200 is returned only after this validation passes.
+
+---
+
+## API
+
+### `GET /health`
+
+```bash
+curl http://103.174.50.194:8000/health
+```
+
+Expected:
+
+```json
+{ "status": "ok" }
+```
+
+### `POST /optimize-energy`
+
+Using the included sample request:
+
+```bash
+curl --fail-with-body \
+  -X POST http://103.174.50.194:8000/optimize-energy \
+  -H "Content-Type: application/json" \
+  --data-binary @examples/request.json
+```
+
+Successful responses contain:
+
+```text
+scenario_id
+directive_interpretation
+hourly_plan
+total_grid_kwh
+total_cost_bdt
+peak_grid_kwh
+plan_summary
+```
+
+### Status codes
+
+| Code  | Meaning                                                  |
+| ----- | -------------------------------------------------------- |
+| `200` | Valid health response or validated optimization result   |
+| `400` | Malformed or invalid request                             |
+| `422` | Well-formed scenario is infeasible                       |
+| `500` | Controlled interpretation/provider/solver/replay failure |
+
+Public errors do not expose prompts, provider bodies, stack traces, API keys, or credentials.
+
+---
+
+## Local Setup
+
+Tested with **Python 3.13**.
+
+```bash
+git clone https://github.com/pabak-dev/BUP-Hackathon-Preli.git
+cd BUP-Hackathon-Preli
+```
+
+### Windows PowerShell
 
 ```powershell
 py -3.13 -m venv .venv
 .venv\Scripts\python.exe -m pip install --require-hashes -r requirements-dev.txt
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-# Edit .env locally: configure provider credentials and explicit model IDs.
+Copy-Item .env.example .env
+# Fill in .env with credentials/model access available to you.
 .venv\Scripts\python.exe -m app
 ```
 
-Linux/macOS:
+### Linux / macOS
 
 ```bash
 python3.13 -m venv .venv
 . .venv/bin/activate
 python -m pip install --require-hashes -r requirements-dev.txt
-test -f .env || cp .env.example .env
-# Edit .env locally: configure provider credentials and explicit model IDs.
+cp .env.example .env
+# Fill in .env with credentials/model access available to you.
 python -m app
 ```
 
-For a production-only install use `requirements.txt` instead. Both files pin transitive versions and hashes. Run all commands from the repository root. The server binds to `0.0.0.0`; default port is `8000`. The `.env` file is loaded without overriding already-set environment variables. No environment activation is necessary for the Windows commands.
+For production-only dependencies:
 
-## Configuration and model
+```bash
+python -m pip install --require-hashes -r requirements.txt
+```
 
-Default failover order: **Vertex AI -> Groq -> Google AI Studio**. Missing provider configuration is skipped. Set model IDs explicitly to models supported by your account, location and structured-output API; there are no assumed model defaults. Select Gemini Flash for Vertex, GPT-OSS for Groq and Gemini Flash-Lite for AI Studio as available. The previously used Groq ID was `openai/gpt-oss-120b`; verify current account access before choosing it.
+---
 
-| Variable name | Purpose / default |
-|---|---|
-| `LLM_PROVIDER_ORDER` | Ordered subset of `vertex,groq,aistudio`; defaults to all three in that order. |
-| `VERTEX_PROJECT_ID` | Google Cloud project with Vertex AI enabled. |
-| `VERTEX_LOCATION` | Location supported by your chosen Vertex model (including `global` when supported). |
-| `VERTEX_MODEL` | Explicit Vertex model ID. |
-| `GROQ_API_KEY`, `GROQ_MODEL` | Groq secret and explicit model ID. |
-| `GEMINI_API_KEY`, `AISTUDIO_MODEL` | AI Studio secret and explicit model ID. |
-| `LLM_PROVIDER_TIMEOUT_SECONDS` | Total time per provider including ADC and validation; default 6, maximum 7 seconds. |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Optional standard ADC path to an external credential/config file. Never commit that file. |
-| `PORT` | HTTP port; default 8000. |
+## Configuration
 
-Migration: replace legacy `LLM_PROVIDER`, `LLM_MODEL`, and `LLM_BASE_URL` with the explicit variables above. A Groq key alone now also requires `GROQ_MODEL`. `.env` stays private and is excluded from Git and Docker; no credentials are embedded in source or images.
+Example `.env`:
 
-Vertex uses official `google-auth[requests]` Application Default Credentials, included in the locked dependencies. For local development install the Google Cloud CLI, enable billing and the Vertex AI API on your project, grant the identity appropriate Vertex AI permissions (normally Vertex AI User), then run:
+```env
+LLM_PROVIDER_ORDER=vertex,groq,aistudio
 
-```powershell
+VERTEX_PROJECT_ID=<YOUR_GCP_PROJECT_ID>
+VERTEX_LOCATION=global
+VERTEX_MODEL=gemini-3.8-flash
+
+GROQ_API_KEY=<YOUR_GROQ_API_KEY>
+GROQ_MODEL=openai/gpt-oss-120b
+
+GEMINI_API_KEY=<YOUR_GEMINI_API_KEY>
+AISTUDIO_MODEL=gemini-3.5-flash-lite
+
+LLM_PROVIDER_TIMEOUT_SECONDS=6
+PORT=8000
+```
+
+Only providers with complete configuration are used. The model IDs above are the models used by the submitted deployment; evaluators may substitute compatible models available to their own accounts.
+
+### Vertex authentication
+
+Vertex uses Google Application Default Credentials.
+
+For local authentication:
+
+```bash
 gcloud auth application-default login
-gcloud auth application-default set-quota-project YOUR_PROJECT_ID
-gcloud services enable aiplatform.googleapis.com --project YOUR_PROJECT_ID
+gcloud auth application-default set-quota-project <YOUR_GCP_PROJECT_ID>
+gcloud services enable aiplatform.googleapis.com --project <YOUR_GCP_PROJECT_ID>
 ```
 
-Set `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, and `VERTEX_MODEL` separately in `.env`. Cloud deployments should use an attached service account or workload identity. A local ADC file is not automatically available inside Docker: supply credentials securely at runtime or use the platform identity; never bake them into the image. See [Google ADC setup](https://cloud.google.com/docs/authentication/provide-credentials-adc) and [Vertex authentication](https://cloud.google.com/vertex-ai/docs/authentication).
+The submitted deployment uses the team's own Google Cloud project, but evaluators should use a project they control and have permission to access.
 
-Separate adapters normalize Groq strict JSON Schema output and Google's native `generateContent` structured output into the same internal `ModelOutput` and public `Directive` objects. Google's schema uses its supported subset; Pydantic always applies the full strict contract locally. Every note is interpreted by a generative model. The model receives only notes and battery capacity, and extracts relevance, one directive, hours, numeric values and a short explanation. It never receives an optimization task, demand arrays, tariffs or credentials.
+Never commit ADC credential files or API keys.
 
-## API examples
+---
 
-Run in a second terminal. On Windows, use `curl.exe` in place of `curl` if PowerShell aliases it.
+## Testing
+
+### Offline tests
+
+These do not use hosted-model quota:
 
 ```bash
-curl --fail-with-body http://127.0.0.1:8000/health
-curl --fail-with-body -X POST http://127.0.0.1:8000/optimize-energy -H "Content-Type: application/json" --data-binary @examples/request.json
+python -m pytest -q
 ```
 
-Ready health is HTTP 200 with exactly `{"status":"ok"}`. Readiness requires at least one configured provider and a working local solver, without spending model quota on health probes. Valid credentials, model access and quota must additionally be checked with a real POST. Missing configuration/unready solver returns a safe 500; the specification does not prescribe an unready body.
+### Individual live provider checks
 
-`examples/request.json` is the first organizer public request. `examples/reference-response.json` is its organizer reference response, clearly separated from generated results. A successful implementation can return a different hourly schedule with the same optimal cost. Request fields are `scenario_id`, 1Ã¢â‚¬â€œ3 nonempty `operator_notes`, 24 unique `hours`, and `battery`. Inputs are strict JSON types, finite and nonnegative; duplicate JSON keys, unknown fields, missing fields, NaN/Infinity, coerced numeric strings, and inconsistent battery bounds are rejected. Input hours may be in any order. No undocumented positive minimum capacity or arbitrary numeric magnitude maximum is imposed.
+These consume hosted-model quota:
 
-The response contains only `scenario_id`, `directive_interpretation`, `hourly_plan`, `total_grid_kwh`, `total_cost_bdt`, `peak_grid_kwh`, and `plan_summary`. Every plan row has `hour`, `grid_kwh`, `solar_used_kwh`, `battery_action`, `battery_kwh`, and `battery_energy_after_kwh`.
+```bash
+python -m scripts.smoke_provider --allow-live --provider vertex
+python -m scripts.smoke_provider --allow-live --provider groq
+python -m scripts.smoke_provider --allow-live --provider aistudio
+```
 
-| Status | Behavior |
-|---|---|
-| 200 | Exact health success or independently validated optimization response. |
-| 400 | Malformed JSON or structurally/semantically invalid request data (the optional 422 distinction is not required). |
-| 422 | A well-formed scenario is infeasible under its validated directives. |
-| 500 | Controlled model/provider/timeout/solver/replay failure; fixed safe JSON message. |
+### Public sample regression
 
-Errors contain an `error` string. Provider bodies, API keys, raw prompts, and stack traces are never returned or logged by application error handlers.
+Against the submitted deployment:
 
-## Architecture and correctness
+```bash
+python -m scripts.verify_samples --allow-live --url http://103.174.50.194:8000
+```
+
+Against a local deployment:
+
+```bash
+python -m scripts.verify_samples --allow-live --url http://127.0.0.1:8000
+```
+
+The verifier checks directive semantics, independently replays schedules, validates totals, and checks optimal cost within the organizer tolerance.
+
+---
+
+## Docker
+
+### Pull submitted image
+
+```bash
+docker pull pabakdev/gridwise:preli-v1
+```
+
+Exact submitted digest:
 
 ```text
-request -> strict request validation -> Vertex / Groq / AI Studio attempts
-        -> structural directive guardrails after each attempt -> LP optimization
-        -> response serialization -> independent replay -> success JSON
+sha256:c618fb3b63f263ae75c26edab1b09a35a8b7ccedb1b3f422f46ee8fd45c80add
 ```
 
-The only allowed directives and exact public adjustments are:
+Pull by digest:
 
-| Directive | structured_adjustment |
-|---|---|
-| `solar_reduction` | `{"hours":[...],"factor":number}` |
-| `minimum_battery_reserve` | `{"hours":[...],"minimum_energy_kwh":number}` |
-| `no_charge_window` | `{"hours":[...]}` |
-| `no_discharge_window` | `{"hours":[...]}` |
-| `max_grid_window` | `{"hours":[...],"max_grid_kwh":number}` |
-| `no_op` | `null` |
+```bash
+docker pull pabakdev/gridwise@sha256:c618fb3b63f263ae75c26edab1b09a35a8b7ccedb1b3f422f46ee8fd45c80add
+```
 
-There must be exactly one ordered interpretation per note. Only no_op has `applies=false`; all other types have `applies=true`. Pydantic rejects extra adjustment fields, invalid enums, noninteger/duplicate/unsorted/out-of-range hours, nonfinite/negative values, factors outside [0,1], and reserves exceeding capacity.
+Run with any configured provider set:
 
-The LLM understands language; deterministic code validates structure and math. There are no evidence fields, quoted-substring checks, time/number regex parsers, English-number normalizers, or deterministic linguistic reinterpretation. The prompt teaches multilingual semantic interpretation, end-exclusive windows, solar reduced BY versus remaining/TO, and percent-of-capacity reserves. Structurally valid outputs are accepted regardless of the original wording. This deliberately leaves semantic accuracy to the model; it cannot change scenario data through the directive schema.
+```bash
+docker run --rm \
+  --name gridwise \
+  -p 8000:8000 \
+  --env-file .env \
+  pabakdev/gridwise:preli-v1
+```
 
-### Mathematical model
+For Vertex ADC, mount a credential file at runtime:
 
-SciPy `linprog(method="highs-ds")` runs HiGHS dual simplex with fixed variable/constraint order, presolve defaults, one solver thread, and a 3-second solver limit. It proves an LP optimum before success. It uses nonnegative grid, solar-used, charge, discharge, and end-of-hour energy variables for all 24 hours.
+```bash
+docker run --rm \
+  --name gridwise \
+  -p 8000:8000 \
+  --env-file .env \
+  -v /path/to/application_default_credentials.json:/run/secrets/gcp-adc.json:ro \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gcp-adc.json \
+  pabakdev/gridwise:preli-v1
+```
+
+The published image contains no API keys or Google credentials.
+
+---
+
+## Repository Structure
 
 ```text
-minimize sum(grid[h] * tariff[h])
-grid[h] + solar_used[h] + discharge[h] = demand[h] + charge[h]
-energy[h] = energy[h-1] + charge[h] - discharge[h]
-energy[-1] = initial_energy; energy[23] = initial_energy
-0 <= solar_used[h] <= original_solar[h] * applicable_factor
-active_reserve[h] <= energy[h] <= capacity
-0 <= charge[h] <= allowed_charge_rate[h]
-0 <= discharge[h] <= allowed_discharge_rate[h]
-0 <= grid[h] <= active_grid_cap[h] (when present)
+app/
+  config.py
+  guardrails.py
+  llm_interpreter.py
+  main.py
+  model_contract.py
+  optimizer.py
+  providers.py
+  schemas.py
+  service.py
+  validator.py
+
+tests/
+scripts/
+examples/
+docs/
 ```
 
-The battery is lossless, unused solar may be curtailed, and grid export is prohibited. Active reserves take the maximum of base/all directive reserves; caps take the minimum of applicable caps. No-charge/no-discharge windows set the respective bound to zero. There is no cycling penalty, peak penalty, invented efficiency, or secondary objective. If the LP contains simultaneous charge/discharge, subtract their common amount: the net preserves all equations, objective, and upper bounds in this lossless model. Only one charge/discharge/idle action is serialized, with a nonnegative magnitude.
+## Known Limitations
 
-`app/validator.py` independently reconstructs solar and directive limits from the original scenario, replays battery state, checks every balance/bound/rate/window/action, and verifies final neutrality. It does not import the optimizer or trust its matrices, feasibility status, or effective profiles. Totals use the final public plan with full float precision, not rounded solver summaries. Internal replay uses absolute tolerance 1e-6; public comparison uses the documented 0.01 kWh/BDT tolerance.
+- Natural-language interpretation still depends on hosted-model accuracy.
+- Provider availability and quota are external dependencies, mitigated by three-provider failover.
+- Unequal overlapping `solar_reduction` factors have no defined composition rule in the supplied specification, so that ambiguity is rejected.
+- Extremely large floating-point magnitudes may exceed practical solver numerical limits.
 
-### Reliability and latency
+## Main Dependencies
 
-One batched call handles all notes per provider attempt. Each configured provider is attempted once, in order, with a six-second total deadline (configurable up to seven). HTTP errors, timeouts, network failures, refusals, malformed JSON and invalid schema/ranges immediately advance to the next provider. Exhaustion returns a safe 500. Invalid clients never reach providers; infeasibility and optimizer/replay errors never trigger provider failover. The existing 27-second request deadline and three-second solver limit remain.
+Python 3.13, FastAPI, Pydantic, HTTPX, Uvicorn, SciPy/HiGHS, NumPy, google-auth, pytest, and Docker.
 
-There is no application rate limiter, pacing, retry backoff, LLM concurrency cap or throttling queue. Transport redirects and retries are disabled by default. ADC refresh uses bounded fail-fast HTTP. An already running ADC thread may finish after cancellation, but cannot issue a model request afterward. Provider quotas and latency remain external constraints; three slow attempts can exceed the rubric's best latency tier even while remaining under the request deadline. Health performs no authentication or model request.
-
-See [verification record](docs/verification.md) for completed checks, measured latency, and outstanding submission artifacts.
-
-## Tests and public regression
-
-Offline tests do not need a key and do not spend provider quota:
-
-```powershell
-.venv\Scripts\python.exe -m pytest -q
-.venv\Scripts\python.exe -m pytest tests/test_public_samples.py -q
-```
-
-These run real application code, guardrails, optimizer, and replay using an explicitly mocked provider transport. Public references are loaded automatically from the root JSON file and only used in tests. Tests compare directive semantics and optimal cost, never exact action sequences. Additional tests cover paraphrases, malformed input/output, provider failover/failure handling, no_op, every directive, repeated requests, zero/full batteries, and tampered schedules. Small random integer cases compare the LP optimum to an independent dynamic program.
-
-Real provider tests (uses configured key and quota; all tests including 27 live cases):
-
-```powershell
-.venv\Scripts\python.exe -m pytest --live -q
-```
-
-Live tests have no artificial pacing. Offline runs block outbound provider/authentication HTTP and skip live tests; these skips are not evidence of live model accuracy.
-
-Run all 10 public cases through a running local, Docker, or deployed HTTP service:
-
-```powershell
-.venv\Scripts\python.exe -m scripts.verify_samples --allow-live --url http://127.0.0.1:8000
-```
-
-Expected: `Passed 10/10`, matching reference directive semantics, valid replay against organizer reference directives, and cost differences <=0.01 BDT. The script checks recalculated totals and writes responses/latencies to `output/sample-report.json` (ignored by Git). Use `--repeat 2` for stability and `--output PATH` to preserve a report. Linux/macOS commands use the activated environment's `python` instead of the Windows executable path.
-
-## Docker build and fallback
-
-The base image is pinned by digest; all Python dependencies are hash-locked. The container runs as an unprivileged user and includes only application source and dependencies. It does not copy `.env`, tests, sample JSON, or local reports. Install Docker Engine/Desktop with Linux containers.
-
-```bash
-docker build -t gridwise:preli .
-docker run --rm --name gridwise -p 8000:8000 --env-file .env gridwise:preli
-curl --fail-with-body http://127.0.0.1:8000/health
-```
-
-Custom port example:
-
-```bash
-docker run --rm --name gridwise -p 8080:8080 --env-file .env -e PORT=8080 gridwise:preli
-```
-
-A Dockerfile/local image is not the required pullable fallback artifact. Choose your actual registry namespace and exact version tag, authenticate, then:
-
-```bash
-docker tag gridwise:preli YOUR_REGISTRY/gridwise:preli-v1
-docker push YOUR_REGISTRY/gridwise:preli-v1
-docker pull YOUR_REGISTRY/gridwise:preli-v1
-docker run --rm --name gridwise -p 8000:8000 --env-file .env YOUR_REGISTRY/gridwise:preli-v1
-```
-
-Replace `YOUR_REGISTRY` with your Docker Hub namespace or registry path. Before submitting, record the real pullable image tag/digest here and in the submission form, verify pull/run on a clean machine, and keep it accessible to judges. The user supplies runtime credentials through environment variables; no secrets are built into the image.
-
-## Deployment and submission
-
-1. Create/use the event GitHub repository after reveal, keep it private during the event, and push reviewed source. Make it public only after the submission deadline.
-2. Deploy this Dockerfile on any public container host (Render/Railway/Fly/etc.), or install `requirements.txt` and run `python -m app` on a Python 3.13 host. No platform-specific application code is required.
-3. Configure the selected providers, explicit model IDs and Vertex ADC privately, allow the platform's `PORT`, and set health check path `/health`. Ensure outbound HTTPS access to the model provider, adequate quota, and no sleep during evaluation.
-4. Expose HTTPS publicly with no login, VPN, manual approval, or private-network restriction. Keep both endpoints available throughout judging.
-5. From a different machine/network, call health, POST the example, and run `python -m scripts.verify_samples --allow-live --url https://YOUR-SERVICE`. Check repeated cases and actual latency/failure rate.
-6. Push and verify the pullable Docker fallback. Submit the public API base URL, repository, README/config/sample request+response, image reference/run command/env names, and accessible <=3-minute video. Use [submission checklist](docs/submission-checklist.md) and [video outline](docs/video-outline.md).
-
-No hosted deployment, registry publication, GitHub visibility change, or video submission is implied by a successful local test. Those artifacts must be supplied through the team's accounts.
-
-## Specification audit and limitations
-
-[docs/spec-audit.md](docs/spec-audit.md) records the pre-code audit of both complete PDFs and all ten JSON examples, source precedence, rubric, and corrections to the proposed plan. Interpretation/application together carry 50/100 points; optimization, API, reliability, deployment/Docker, and documentation carry 10 each. Video has no base score but is the first tie-break.
-
-- Unequal solar-reduction factors covering the same hour have no defined composition/precedence rule in the supplied problem. The service rejects this ambiguity; it does not silently multiply or choose one. Identical factors are redundant.
-- The supplied problem does not define wraparound/cross-midnight semantics. The prompt does not invent a composition rule; contextual language interpretation is the model's responsibility. No deterministic language parser claims to resolve this ambiguity.
-- The guide's optimization formula for zero optimum/nonzero team cost is visibly cut off after `quality_ratio`. No missing scoring rule has been invented in the service.
-- Semantic model mistakes can survive structural checks. Tests measure this risk; the judge independently checks its own ground truth.
-- Extremely large floating-point magnitudes may exceed solver numerical range. No artificial request bound is claimed by the specification; unsupported numerical solves fail in a controlled way.
-- Hosted-provider availability, rate limits, and valid credentials remain external dependencies. Health does not validate quota or authenticate a key on every probe. All new provider adapters require account-specific live verification before judging; no hosted-model calls were made during the failover change.
-
-## Files and credits
-
-`app/` contains configuration, strict schemas, the real model adapter, deterministic guardrails, LP optimizer, independent validator, API, and service orchestration. `tests/` contains offline/live public regressions and hidden-style checks. `scripts/verify_samples.py` exercises HTTP deployments; `examples/` contains attributed organizer sample data; `docs/` contains the audit and submission/video aids.
-
-External libraries/tools: Python, FastAPI/Starlette, Pydantic, HTTPX, Uvicorn, SciPy/HiGHS, NumPy, python-dotenv, google-auth, pytest, Ruff, uv, Docker; Groq's hosted OpenAI GPT-OSS model (or configured Google Gemini); OpenAI Codex assisted implementation and verification. Organizer problem/guide/public samples define the challenge and reference data. No live campus, utility, billing, or personal data is used.
-
-## Manual provider checks (consume hosted-model quota)
-
-These are opt-in commands, not part of offline verification. Run from the repository root. Each isolated smoke sends one model request and replays the resulting schedule. The full public regression sends ten requests, potentially up to thirty model attempts with failover.
-
-```powershell
-.venv\Scripts\python.exe -m scripts.smoke_provider --allow-live --provider vertex
-.venv\Scripts\python.exe -m scripts.smoke_provider --allow-live --provider groq
-.venv\Scripts\python.exe -m scripts.smoke_provider --allow-live --provider aistudio
-# Start the API in one terminal:
-.venv\Scripts\python.exe -m app
-# Run the ten public cases in another:
-.venv\Scripts\python.exe -m scripts.verify_samples --allow-live --url http://127.0.0.1:8000
-# Local failure injection skips the primary without calling it; the fallback is real:
-.venv\Scripts\python.exe -m scripts.smoke_provider --allow-live --provider chain --simulate-failure vertex
-.venv\Scripts\python.exe -m scripts.smoke_provider --allow-live --provider chain --simulate-failure vertex groq
-```
-
-Failure injection exists only in the manual script; it never changes production behavior. It checks orchestration with a real fallback, not genuine provider outage behavior. Mocked tests cover actual HTTP 429/500/timeouts, malformed/refused output, strict guardrail rejection, all-provider exhaustion and no failover after math errors. Smoke scripts print safe results/provider names without raw provider errors or secrets.
+OpenAI Codex assisted implementation and verification.
