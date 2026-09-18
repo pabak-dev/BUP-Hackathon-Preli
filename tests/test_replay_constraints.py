@@ -37,14 +37,6 @@ def test_replay_rejects_a_feasible_plan_that_ignores_directive(base_request, kin
         validate_schedule(request, truth, response)
 
 
-def test_explicit_reduced_by_cannot_be_disguised_by_usable_word(base_request):
-    base_request["operator_notes"] = ["Usable solar is reduced by 70% from 1 PM to 3 PM."]
-    raw = model_output(base_request, [directive("solar_reduction", [13, 14], 0.7)])
-    raw["entries"][0]["evidence"]["value_kind"] = "remaining_fraction"
-    with pytest.raises(InterpretationError):
-        validate_model_output(OptimizeRequest.model_validate(base_request), raw)
-
-
 def test_overlapping_unequal_solar_factors_fail_without_invented_composition(base_request):
     base_request["operator_notes"] = ["Keep solar at 50% from 1 PM to 3 PM.", "Keep solar at 20% from 2 PM to 4 PM."]
     expected = [directive("solar_reduction", [13, 14], 0.5), directive("solar_reduction", [14, 15], 0.2, index=1)]

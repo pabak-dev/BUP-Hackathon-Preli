@@ -52,12 +52,14 @@ def verify(case, actual):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:8000")
-    parser.add_argument("--delay", type=float, default=17, help="Seconds between requests; excluded from latency")
+    parser.add_argument(
+        "--allow-live", action="store_true", required=True, help="Explicitly authorize hosted-model quota"
+    )
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--output", type=Path, default=ROOT / "output" / "sample-report.json")
     args = parser.parse_args()
-    if args.repeat < 1 or args.delay < 0:
-        parser.error("repeat must be positive and delay must be nonnegative")
+    if args.repeat < 1:
+        parser.error("repeat must be positive")
     cases = json.loads(SAMPLES.read_text(encoding="utf-8-sig"))["cases"]
     records = []
     with httpx.Client(base_url=args.url.rstrip("/"), timeout=30) as client:
@@ -66,8 +68,6 @@ def main():
             raise SystemExit("Health check failed")
         for iteration in range(args.repeat):
             for case in cases:
-                if records:
-                    time.sleep(args.delay)
                 start = time.perf_counter()
                 record = {"case": case["id"], "iteration": iteration + 1}
                 try:

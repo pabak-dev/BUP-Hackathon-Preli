@@ -57,7 +57,7 @@ def create_app(settings: Settings | None = None, transport: httpx.AsyncBaseTrans
 
     @api.get("/health")
     async def health():
-        if not config.api_key or not getattr(api.state, "solver_ready", False):
+        if not config.ready or not getattr(api.state, "solver_ready", False):
             return JSONResponse({"error": "Service is not configured or ready"}, status_code=500)
         return {"status": "ok"}
 

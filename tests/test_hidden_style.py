@@ -78,7 +78,7 @@ def test_hidden_style_live(base_request, variant):
     note, kind, hours, value = variant
     base_request["operator_notes"] = [note]
     settings = Settings.from_env()
-    assert settings.api_key, "Live tests require a configured provider key"
+    assert settings.ready, "Live tests require configured provider credentials and model IDs"
     with TestClient(create_app(settings)) as client:
         response = client.post("/optimize-energy", json=base_request)
     assert response.status_code == 200, response.text

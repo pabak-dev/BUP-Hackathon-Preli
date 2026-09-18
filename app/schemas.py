@@ -106,21 +106,8 @@ class Directive(StrictModel):
         return self
 
 
-class Evidence(StrictModel):
-    time_text: str | None
-    value_text: str | None
-    value_kind: Literal[
-        "none", "remaining_fraction", "reduction_fraction", "reserve_fraction", "reserve_kwh", "grid_kwh"
-    ]
-
-
-class ModelEntry(StrictModel):
-    interpretation: Directive
-    evidence: Evidence
-
-
 class ModelOutput(StrictModel):
-    entries: list[ModelEntry]
+    entries: list[Directive]
 
 
 class PlanHour(StrictModel):

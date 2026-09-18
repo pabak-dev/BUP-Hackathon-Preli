@@ -12,7 +12,7 @@ Windows PowerShell:
 py -3.13 -m venv .venv
 .venv\Scripts\python.exe -m pip install --require-hashes -r requirements-dev.txt
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-# Edit .env locally and set GROQ_API_KEY.
+# Edit .env locally: configure provider credentials and explicit model IDs.
 .venv\Scripts\python.exe -m app
 ```
 
@@ -23,7 +23,7 @@ python3.13 -m venv .venv
 . .venv/bin/activate
 python -m pip install --require-hashes -r requirements-dev.txt
 test -f .env || cp .env.example .env
-# Edit .env locally and set GROQ_API_KEY.
+# Edit .env locally: configure provider credentials and explicit model IDs.
 python -m app
 ```
 
@@ -31,20 +31,33 @@ For a production-only install use `requirements.txt` instead. Both files pin tra
 
 ## Configuration and model
 
+Default failover order: **Vertex AI -> Groq -> Google AI Studio**. Missing provider configuration is skipped. Set model IDs explicitly to models supported by your account, location and structured-output API; there are no assumed model defaults. Select Gemini Flash for Vertex, GPT-OSS for Groq and Gemini Flash-Lite for AI Studio as available. The previously used Groq ID was `openai/gpt-oss-120b`; verify current account access before choosing it.
+
 | Variable name | Purpose / default |
 |---|---|
-| `GROQ_API_KEY` | Required secret for the default Groq provider; obtain from your Groq account and set privately. |
-| `LLM_PROVIDER` | Optional: `groq` (default) or `gemini`. |
-| `GEMINI_API_KEY` | Required instead of GROQ_API_KEY when selecting Gemini; obtain from Google AI Studio. |
-| `LLM_MODEL` | Optional model override. Groq default: `openai/gpt-oss-120b`; Gemini default: `gemini-2.5-flash`. |
-| `LLM_BASE_URL` | Optional API endpoint override; normal provider URLs are selected automatically. |
-| `PORT` | Optional HTTP port; default `8000`. |
+| `LLM_PROVIDER_ORDER` | Ordered subset of `vertex,groq,aistudio`; defaults to all three in that order. |
+| `VERTEX_PROJECT_ID` | Google Cloud project with Vertex AI enabled. |
+| `VERTEX_LOCATION` | Location supported by your chosen Vertex model (including `global` when supported). |
+| `VERTEX_MODEL` | Explicit Vertex model ID. |
+| `GROQ_API_KEY`, `GROQ_MODEL` | Groq secret and explicit model ID. |
+| `GEMINI_API_KEY`, `AISTUDIO_MODEL` | AI Studio secret and explicit model ID. |
+| `LLM_PROVIDER_TIMEOUT_SECONDS` | Total time per provider including ADC and validation; default 6, maximum 7 seconds. |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Optional standard ADC path to an external credential/config file. Never commit that file. |
+| `PORT` | HTTP port; default 8000. |
 
-Only `GROQ_API_KEY` is needed for the default configuration. No key values belong in this README, Git, Docker layers, screenshots, or submission fields. `.env` is ignored by Git and excluded from Docker's allowlisted build context.
+Migration: replace legacy `LLM_PROVIDER`, `LLM_MODEL`, and `LLM_BASE_URL` with the explicit variables above. A Groq key alone now also requires `GROQ_MODEL`. `.env` stays private and is excluded from Git and Docker; no credentials are embedded in source or images.
 
-Groq uses `https://api.groq.com/openai/v1/chat/completions`. Gemini uses `https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`. The same HTTP adapter requests strict JSON Schema output. See [Groq structured outputs](https://console.groq.com/docs/structured-outputs), [GPT-OSS 120B](https://console.groq.com/docs/model/openai/gpt-oss-120b), and [Gemini OpenAI compatibility](https://ai.google.dev/gemini-api/docs/openai). Gemini is an optional configuration, not an automatically invoked fallback; test its model/schema access before switching a deployment.
+Vertex uses official `google-auth[requests]` Application Default Credentials, included in the locked dependencies. For local development install the Google Cloud CLI, enable billing and the Vertex AI API on your project, grant the identity appropriate Vertex AI permissions (normally Vertex AI User), then run:
 
-The model is responsible only for relevance, directive type, affected hours, numeric values, and a short explanation. It receives notes and battery capacity (needed for percentage reserves), never credentials, demand arrays, tariffs, or an optimization task. Every request calls the real model, including irrelevant notes and repeated requests. There is no regex-only interpreter, cached sample answer, or silent no_op fallback.
+```powershell
+gcloud auth application-default login
+gcloud auth application-default set-quota-project YOUR_PROJECT_ID
+gcloud services enable aiplatform.googleapis.com --project YOUR_PROJECT_ID
+```
+
+Set `VERTEX_PROJECT_ID`, `VERTEX_LOCATION`, and `VERTEX_MODEL` separately in `.env`. Cloud deployments should use an attached service account or workload identity. A local ADC file is not automatically available inside Docker: supply credentials securely at runtime or use the platform identity; never bake them into the image. See [Google ADC setup](https://cloud.google.com/docs/authentication/provide-credentials-adc) and [Vertex authentication](https://cloud.google.com/vertex-ai/docs/authentication).
+
+Separate adapters normalize Groq strict JSON Schema output and Google's native `generateContent` structured output into the same internal `ModelOutput` and public `Directive` objects. Google's schema uses its supported subset; Pydantic always applies the full strict contract locally. Every note is interpreted by a generative model. The model receives only notes and battery capacity, and extracts relevance, one directive, hours, numeric values and a short explanation. It never receives an optimization task, demand arrays, tariffs or credentials.
 
 ## API examples
 
@@ -55,7 +68,7 @@ curl --fail-with-body http://127.0.0.1:8000/health
 curl --fail-with-body -X POST http://127.0.0.1:8000/optimize-energy -H "Content-Type: application/json" --data-binary @examples/request.json
 ```
 
-Ready health is HTTP 200 with exactly `{"status":"ok"}`. Readiness requires a configured provider key and a working local solver, without spending model quota on health probes. A valid key/quota must additionally be checked with a real POST. Missing configuration/unready solver returns a safe 500; the specification does not prescribe an unready body.
+Ready health is HTTP 200 with exactly `{"status":"ok"}`. Readiness requires at least one configured provider and a working local solver, without spending model quota on health probes. Valid credentials, model access and quota must additionally be checked with a real POST. Missing configuration/unready solver returns a safe 500; the specification does not prescribe an unready body.
 
 `examples/request.json` is the first organizer public request. `examples/reference-response.json` is its organizer reference response, clearly separated from generated results. A successful implementation can return a different hourly schedule with the same optimal cost. Request fields are `scenario_id`, 1Ã¢â‚¬â€œ3 nonempty `operator_notes`, 24 unique `hours`, and `battery`. Inputs are strict JSON types, finite and nonnegative; duplicate JSON keys, unknown fields, missing fields, NaN/Infinity, coerced numeric strings, and inconsistent battery bounds are rejected. Input hours may be in any order. No undocumented positive minimum capacity or arbitrary numeric magnitude maximum is imposed.
 
@@ -73,8 +86,8 @@ Errors contain an `error` string. Provider bodies, API keys, raw prompts, and st
 ## Architecture and correctness
 
 ```text
-request -> strict request validation -> one batched hosted LLM call
-        -> deterministic directive/evidence guardrails -> LP optimization
+request -> strict request validation -> Vertex / Groq / AI Studio attempts
+        -> structural directive guardrails after each attempt -> LP optimization
         -> response serialization -> independent replay -> success JSON
 ```
 
@@ -91,7 +104,7 @@ The only allowed directives and exact public adjustments are:
 
 There must be exactly one ordered interpretation per note. Only no_op has `applies=false`; all other types have `applies=true`. Pydantic rejects extra adjustment fields, invalid enums, noninteger/duplicate/unsorted/out-of-range hours, nonfinite/negative values, factors outside [0,1], and reserves exceeding capacity.
 
-Internally, the model supplies exact quoted time and numeric evidence. General deterministic normalizers check whole-hour start-inclusive/end-exclusive ranges, AM/PM/noon/midnight, 24-hour clocks, explicit all-day/hour lists, numeric words, supported fractions, percent-of-capacity reserves, and remaining versus reduced solar. Evidence is stripped before public serialization. Unsupported or unresolved evidence is rejected, with at most one repair. These checks constrain the model's extraction; relevance and linguistic context still require the model. Code does not manufacture a directive when interpretation fails.
+The LLM understands language; deterministic code validates structure and math. There are no evidence fields, quoted-substring checks, time/number regex parsers, English-number normalizers, or deterministic linguistic reinterpretation. The prompt teaches multilingual semantic interpretation, end-exclusive windows, solar reduced BY versus remaining/TO, and percent-of-capacity reserves. Structurally valid outputs are accepted regardless of the original wording. This deliberately leaves semantic accuracy to the model; it cannot change scenario data through the directive schema.
 
 ### Mathematical model
 
@@ -115,9 +128,9 @@ The battery is lossless, unused solar may be curtailed, and grid export is prohi
 
 ### Reliability and latency
 
-One model call handles all 1Ã¢â‚¬â€œ3 notes. A maximum of two provider attempts covers transient failures or one structured-output repair; each attempt has a 10-second total deadline. The request deadline is 27 seconds, leaving margin below the judge's 30-second timeout. Temperature is zero and GPT-OSS reasoning effort is low. There are no agents, retrieval, training, or model-based optimization loops. The optimizer is deterministic for fixed inputs/directives and runtime; model interpretation is not mathematically guaranteed deterministic.
+One batched call handles all notes per provider attempt. Each configured provider is attempted once, in order, with a six-second total deadline (configurable up to seven). HTTP errors, timeouts, network failures, refusals, malformed JSON and invalid schema/ranges immediately advance to the next provider. Exhaustion returns a safe 500. Invalid clients never reach providers; infeasibility and optimizer/replay errors never trigger provider failover. The existing 27-second request deadline and three-second solver limit remain.
 
-Groq free-tier quota observed during development was 8,000 tokens/minute. A burst can exhaust quota even with fast individual responses. The regression runner spaces requests by 17 seconds by default; that spacing is excluded from measured request latency. Judging traffic may require a paid quota or another tested model/account. The guide requires p95 <=5 seconds for full latency points, <=15 seconds for partial credit, health readiness within 60 seconds, and availability throughout evaluation. Local test measurements are not a guarantee of deployed latency.
+There is no application rate limiter, pacing, retry backoff, LLM concurrency cap or throttling queue. Transport redirects and retries are disabled by default. ADC refresh uses bounded fail-fast HTTP. An already running ADC thread may finish after cancellation, but cannot issue a model request afterward. Provider quotas and latency remain external constraints; three slow attempts can exceed the rubric's best latency tier even while remaining under the request deadline. Health performs no authentication or model request.
 
 See [verification record](docs/verification.md) for completed checks, measured latency, and outstanding submission artifacts.
 
@@ -130,7 +143,7 @@ Offline tests do not need a key and do not spend provider quota:
 .venv\Scripts\python.exe -m pytest tests/test_public_samples.py -q
 ```
 
-These run real application code, guardrails, optimizer, and replay using an explicitly mocked provider transport. Public references are loaded automatically from the root JSON file and only used in tests. Tests compare directive semantics and optimal cost, never exact action sequences. Additional tests cover paraphrases, malformed input/output, repair/failure handling, no_op, every directive, repeated requests, zero/full batteries, and tampered schedules. Small random integer cases compare the LP optimum to an independent dynamic program.
+These run real application code, guardrails, optimizer, and replay using an explicitly mocked provider transport. Public references are loaded automatically from the root JSON file and only used in tests. Tests compare directive semantics and optimal cost, never exact action sequences. Additional tests cover paraphrases, malformed input/output, provider failover/failure handling, no_op, every directive, repeated requests, zero/full batteries, and tampered schedules. Small random integer cases compare the LP optimum to an independent dynamic program.
 
 Real provider tests (uses configured key and quota; all tests including 27 live cases):
 
@@ -138,15 +151,15 @@ Real provider tests (uses configured key and quota; all tests including 27 live 
 .venv\Scripts\python.exe -m pytest --live -q
 ```
 
-Each live case is paced by 17 seconds to fit the observed free-tier quota. Offline test runs explicitly report these as skipped; skipped live tests are not evidence of LLM accuracy.
+Live tests have no artificial pacing. Offline runs block outbound provider/authentication HTTP and skip live tests; these skips are not evidence of live model accuracy.
 
 Run all 10 public cases through a running local, Docker, or deployed HTTP service:
 
 ```powershell
-.venv\Scripts\python.exe -m scripts.verify_samples --url http://127.0.0.1:8000
+.venv\Scripts\python.exe -m scripts.verify_samples --allow-live --url http://127.0.0.1:8000
 ```
 
-Expected: `Passed 10/10`, matching reference directive semantics, valid replay against organizer reference directives, and cost differences <=0.01 BDT. The script checks recalculated totals and writes responses/latencies to `output/sample-report.json` (ignored by Git). Use `--repeat 2` for stability, `--delay 0` only with adequate provider quota, and `--output PATH` to preserve a report. Linux/macOS commands use the activated environment's `python` instead of the Windows executable path.
+Expected: `Passed 10/10`, matching reference directive semantics, valid replay against organizer reference directives, and cost differences <=0.01 BDT. The script checks recalculated totals and writes responses/latencies to `output/sample-report.json` (ignored by Git). Use `--repeat 2` for stability and `--output PATH` to preserve a report. Linux/macOS commands use the activated environment's `python` instead of the Windows executable path.
 
 ## Docker build and fallback
 
@@ -179,9 +192,9 @@ Replace `YOUR_REGISTRY` with your Docker Hub namespace or registry path. Before 
 
 1. Create/use the event GitHub repository after reveal, keep it private during the event, and push reviewed source. Make it public only after the submission deadline.
 2. Deploy this Dockerfile on any public container host (Render/Railway/Fly/etc.), or install `requirements.txt` and run `python -m app` on a Python 3.13 host. No platform-specific application code is required.
-3. Configure `GROQ_API_KEY` privately (or select/configure Gemini), allow the platform's `PORT`, and set health check path `/health`. Ensure outbound HTTPS access to the model provider, adequate quota, and no sleep during evaluation.
+3. Configure the selected providers, explicit model IDs and Vertex ADC privately, allow the platform's `PORT`, and set health check path `/health`. Ensure outbound HTTPS access to the model provider, adequate quota, and no sleep during evaluation.
 4. Expose HTTPS publicly with no login, VPN, manual approval, or private-network restriction. Keep both endpoints available throughout judging.
-5. From a different machine/network, call health, POST the example, and run `python -m scripts.verify_samples --url https://YOUR-SERVICE`. Check repeated cases and actual latency/failure rate.
+5. From a different machine/network, call health, POST the example, and run `python -m scripts.verify_samples --allow-live --url https://YOUR-SERVICE`. Check repeated cases and actual latency/failure rate.
 6. Push and verify the pullable Docker fallback. Submit the public API base URL, repository, README/config/sample request+response, image reference/run command/env names, and accessible <=3-minute video. Use [submission checklist](docs/submission-checklist.md) and [video outline](docs/video-outline.md).
 
 No hosted deployment, registry publication, GitHub visibility change, or video submission is implied by a successful local test. Those artifacts must be supplied through the team's accounts.
@@ -191,15 +204,33 @@ No hosted deployment, registry publication, GitHub visibility change, or video s
 [docs/spec-audit.md](docs/spec-audit.md) records the pre-code audit of both complete PDFs and all ten JSON examples, source precedence, rubric, and corrections to the proposed plan. Interpretation/application together carry 50/100 points; optimization, API, reliability, deployment/Docker, and documentation carry 10 each. Video has no base score but is the first tie-break.
 
 - Unequal solar-reduction factors covering the same hour have no defined composition/precedence rule in the supplied problem. The service rejects this ambiguity; it does not silently multiply or choose one. Identical factors are redundant.
-- The supplied problem does not define wraparound/cross-midnight windows. Clear ranges ending at midnight are supported; windows crossing into the next day or unresolved/missing times fail safely. English whole-hour expressions and common English numeric fractions are supported by the evidence checker. Unknown phrasing can safely fail instead of being guessed.
-- The statement's afternoon example omits AM/PM in one paraphrase. The model supplies contextual disambiguation; deterministic checks validate possible clock mappings, not arbitrary English meaning.
+- The supplied problem does not define wraparound/cross-midnight semantics. The prompt does not invent a composition rule; contextual language interpretation is the model's responsibility. No deterministic language parser claims to resolve this ambiguity.
 - The guide's optimization formula for zero optimum/nonzero team cost is visibly cut off after `quality_ratio`. No missing scoring rule has been invented in the service.
-- Semantic model mistakes can survive structural/evidence checks. Tests measure this risk; the judge independently checks its own ground truth.
+- Semantic model mistakes can survive structural checks. Tests measure this risk; the judge independently checks its own ground truth.
 - Extremely large floating-point magnitudes may exceed solver numerical range. No artificial request bound is claimed by the specification; unsupported numerical solves fail in a controlled way.
-- Hosted-provider availability, rate limits, and valid credentials remain external dependencies. Health does not validate quota or authenticate a key on every probe. Gemini configuration needs its own live verification if used.
+- Hosted-provider availability, rate limits, and valid credentials remain external dependencies. Health does not validate quota or authenticate a key on every probe. All new provider adapters require account-specific live verification before judging; no hosted-model calls were made during the failover change.
 
 ## Files and credits
 
 `app/` contains configuration, strict schemas, the real model adapter, deterministic guardrails, LP optimizer, independent validator, API, and service orchestration. `tests/` contains offline/live public regressions and hidden-style checks. `scripts/verify_samples.py` exercises HTTP deployments; `examples/` contains attributed organizer sample data; `docs/` contains the audit and submission/video aids.
 
-External libraries/tools: Python, FastAPI/Starlette, Pydantic, HTTPX, Uvicorn, SciPy/HiGHS, NumPy, python-dotenv, pytest, Ruff, uv, Docker; Groq's hosted OpenAI GPT-OSS model (or configured Google Gemini); OpenAI Codex assisted implementation and verification. Organizer problem/guide/public samples define the challenge and reference data. No live campus, utility, billing, or personal data is used.
+External libraries/tools: Python, FastAPI/Starlette, Pydantic, HTTPX, Uvicorn, SciPy/HiGHS, NumPy, python-dotenv, google-auth, pytest, Ruff, uv, Docker; Groq's hosted OpenAI GPT-OSS model (or configured Google Gemini); OpenAI Codex assisted implementation and verification. Organizer problem/guide/public samples define the challenge and reference data. No live campus, utility, billing, or personal data is used.
+
+## Manual provider checks (consume hosted-model quota)
+
+These are opt-in commands, not part of offline verification. Run from the repository root. Each isolated smoke sends one model request and replays the resulting schedule. The full public regression sends ten requests, potentially up to thirty model attempts with failover.
+
+```powershell
+.venv\Scripts\python.exe -m scripts.smoke_provider --allow-live --provider vertex
+.venv\Scripts\python.exe -m scripts.smoke_provider --allow-live --provider groq
+.venv\Scripts\python.exe -m scripts.smoke_provider --allow-live --provider aistudio
+# Start the API in one terminal:
+.venv\Scripts\python.exe -m app
+# Run the ten public cases in another:
+.venv\Scripts\python.exe -m scripts.verify_samples --allow-live --url http://127.0.0.1:8000
+# Local failure injection skips the primary without calling it; the fallback is real:
+.venv\Scripts\python.exe -m scripts.smoke_provider --allow-live --provider chain --simulate-failure vertex
+.venv\Scripts\python.exe -m scripts.smoke_provider --allow-live --provider chain --simulate-failure vertex groq
+```
+
+Failure injection exists only in the manual script; it never changes production behavior. It checks orchestration with a real fallback, not genuine provider outage behavior. Mocked tests cover actual HTTP 429/500/timeouts, malformed/refused output, strict guardrail rejection, all-provider exhaustion and no failover after math errors. Smoke scripts print safe results/provider names without raw provider errors or secrets.

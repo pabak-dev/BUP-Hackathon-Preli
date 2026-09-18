@@ -55,7 +55,7 @@ def test_public_reference_is_valid(case):
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c["id"])
 def test_public_sample_live(case):
     settings = Settings.from_env()
-    assert settings.api_key, "Configure GROQ_API_KEY or GEMINI_API_KEY locally before --live"
+    assert settings.ready, "Configure provider credentials and model IDs before --live"
     with TestClient(create_app(settings)) as client:
         response = client.post("/optimize-energy", json=case["input"])
     assert response.status_code == 200, response.text

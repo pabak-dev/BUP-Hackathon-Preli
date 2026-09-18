@@ -1,6 +1,5 @@
 import copy
 import json
-import time
 from pathlib import Path
 
 import httpx
@@ -20,9 +19,19 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture(autouse=True)
-def pace_live_requests(request):
-    if "live" in request.keywords:
-        time.sleep(17)  # Groq free tier: 8k tokens/minute; regression pacing, not service latency.
+def forbid_live_network(request, monkeypatch):
+    if "live" not in request.keywords:
+
+        async def blocked(*args, **kwargs):
+            raise AssertionError("Offline tests must never use external HTTP")
+
+        def blocked_sync(*args, **kwargs):
+            raise AssertionError("Offline tests must never use external authentication HTTP")
+
+        monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", blocked)
+        import requests
+
+        monkeypatch.setattr(requests.Session, "request", blocked_sync)
 
 
 def pytest_collection_modifyitems(config, items):
@@ -75,31 +84,7 @@ def directive(kind="no_op", hours=None, value=None, index=0):
 
 
 def model_output(request, directives):
-    """Explicit test double data. Never imported by production code or used as live evidence."""
-    entries = []
-    for d in directives:
-        note = request["operator_notes"][d["note_index"]]
-        kind = d["directive_type"]
-        value_kind = "none"
-        if kind == "solar_reduction":
-            value_kind = (
-                "reduction_fraction" if "reduction" in note.lower() or "by " in note.lower() else "remaining_fraction"
-            )
-        elif kind == "minimum_battery_reserve":
-            value_kind = "reserve_fraction" if "%" in note or "percent" in note or "half" in note else "reserve_kwh"
-        elif kind == "max_grid_window":
-            value_kind = "grid_kwh"
-        entries.append(
-            {
-                "interpretation": copy.deepcopy(d),
-                "evidence": {
-                    "time_text": None if kind == "no_op" else note,
-                    "value_text": None if value_kind == "none" else note,
-                    "value_kind": value_kind,
-                },
-            }
-        )
-    return {"entries": entries}
+    return {"entries": copy.deepcopy(directives)}
 
 
 def mock_client(request, directives, capture=None):
@@ -112,4 +97,9 @@ def mock_client(request, directives, capture=None):
             200, json={"choices": [{"finish_reason": "stop", "message": {"content": json.dumps(output)}}]}
         )
 
-    return TestClient(create_app(Settings(api_key="test-only-placeholder"), transport=httpx.MockTransport(respond)))
+    return TestClient(
+        create_app(
+            Settings(provider_order=("groq",), groq_api_key="test-only-placeholder", groq_model="test-model"),
+            transport=httpx.MockTransport(respond),
+        )
+    )

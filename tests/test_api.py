@@ -69,7 +69,9 @@ def test_structural_invalidity_is_400(base_request, change):
 
 @pytest.mark.parametrize("raw", ["{", "null", "[]", '{"a":1,"a":2}', '{"x":NaN}', '{"x":Infinity}', '"text"'])
 def test_malformed_json(raw):
-    with TestClient(create_app(Settings(api_key="test"))) as client:
+    with TestClient(
+        create_app(Settings(provider_order=("groq",), groq_model="test-model", groq_api_key="test"))
+    ) as client:
         result = client.post("/optimize-energy", content=raw, headers={"Content-Type": "application/json"})
     assert result.status_code == 400
 
@@ -83,15 +85,19 @@ def test_provider_errors_safe(base_request, status, caplog):
         calls.append(request)
         return httpx.Response(status, text=secret)
 
-    with TestClient(create_app(Settings(api_key=secret), httpx.MockTransport(fail))) as client:
+    with TestClient(
+        create_app(
+            Settings(provider_order=("groq",), groq_model="test-model", groq_api_key=secret), httpx.MockTransport(fail)
+        )
+    ) as client:
         response = client.post("/optimize-energy", json=base_request)
         assert client.get("/health").status_code == 200
     assert response.status_code == 500
     assert secret not in response.text + caplog.text
-    assert len(calls) == (1 if status == 401 else 2)
+    assert len(calls) == 1
 
 
-def test_repair_once(base_request):
+def test_no_same_provider_retry(base_request):
     calls = []
 
     def respond(request):
@@ -99,10 +105,15 @@ def test_repair_once(base_request):
         content = "{bad" if len(calls) == 1 else json.dumps(model_output(base_request, [directive()]))
         return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {"content": content}}]})
 
-    with TestClient(create_app(Settings(api_key="test"), httpx.MockTransport(respond))) as client:
+    with TestClient(
+        create_app(
+            Settings(provider_order=("groq",), groq_model="test-model", groq_api_key="test"),
+            httpx.MockTransport(respond),
+        )
+    ) as client:
         response = client.post("/optimize-energy", json=base_request)
-    assert response.status_code == 200
-    assert len(calls) == 2
+    assert response.status_code == 500
+    assert len(calls) == 1
     assert "{bad" not in json.dumps(calls[-1])
 
 
@@ -126,10 +137,15 @@ def test_unrecoverable_model_failure(base_request, mode):
             },
         )
 
-    with TestClient(create_app(Settings(api_key="test"), httpx.MockTransport(respond))) as client:
+    with TestClient(
+        create_app(
+            Settings(provider_order=("groq",), groq_model="test-model", groq_api_key="test"),
+            httpx.MockTransport(respond),
+        )
+    ) as client:
         response = client.post("/optimize-energy", json=base_request)
     assert response.status_code == 500
-    assert len(calls) == 2
+    assert len(calls) == 1
 
 
 def test_missing_key_is_not_ready(base_request):

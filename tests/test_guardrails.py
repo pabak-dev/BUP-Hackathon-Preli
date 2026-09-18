@@ -3,62 +3,9 @@ import copy
 import pytest
 
 from app.errors import InterpretationError
-from app.guardrails import quantity, validate_model_output, validate_time
+from app.guardrails import validate_model_output
 from app.schemas import OptimizeRequest
 from tests.conftest import directive, model_output
-
-
-@pytest.mark.parametrize(
-    "text,hours",
-    [
-        ("1 PM to 3 PM", [13, 14]),
-        ("13:00-15:00", [13, 14]),
-        ("one until three", [13, 14]),
-        ("11 AM until 1 PM", [11, 12]),
-        ("noon until 2 PM", [12, 13]),
-        ("10 PM to midnight", [22, 23]),
-        ("midnight to 2 AM", [0, 1]),
-        ("00:00 to 24:00", list(range(24))),
-        ("all day", list(range(24))),
-        ("hours 2, 5 and 8", [2, 5, 8]),
-        ("from 1-3 PM", [13, 14]),
-        ("from 02:00 until 05:00", [2, 3, 4]),
-    ],
-)
-def test_time_normalization(text, hours):
-    validate_time(text, hours)
-
-
-@pytest.mark.parametrize(
-    "text,hours",
-    [
-        ("1 PM to 3 PM", [13, 14, 15]),
-        ("1 PM to 3 PM", [1, 2]),
-        ("13:30 to 15:00", [13, 14]),
-        ("all day", [12]),
-        ("10 PM to 2 AM", [0, 1, 22, 23]),
-        ("sometime later", [12]),
-    ],
-)
-def test_bad_time_rejected(text, hours):
-    with pytest.raises(InterpretationError):
-        validate_time(text, hours)
-
-
-@pytest.mark.parametrize(
-    "text,fraction,expected",
-    [
-        ("half of forecast", True, 0.5),
-        ("one-fifth of output", True, 0.2),
-        ("eighty percent", True, 0.8),
-        ("one hundred and twenty kWh", False, 120),
-        ("1,234.5 kWh", False, 1234.5),
-        ("0%", True, 0),
-        ("100%", True, 1),
-    ],
-)
-def test_numeric_evidence(text, fraction, expected):
-    assert quantity(text, fraction) == pytest.approx(expected)
 
 
 @pytest.mark.parametrize(
@@ -75,16 +22,12 @@ def test_numeric_evidence(text, fraction, expected):
         "index",
         "missing",
         "factor",
-        "invention",
-        "time",
-        "quote",
-        "polarity",
     ],
 )
 def test_invalid_model_data(base_request, mutation):
     base_request["operator_notes"] = ["Expect an 80% reduction in solar from 1 PM to 3 PM."]
     raw = model_output(base_request, [directive("solar_reduction", [13, 14], 0.2)])
-    d = raw["entries"][0]["interpretation"]
+    d = raw["entries"][0]
     adj = d["structured_adjustment"]
     if mutation == "extra":
         adj["demand_kwh"] = 3
@@ -108,15 +51,6 @@ def test_invalid_model_data(base_request, mutation):
         raw["entries"] = []
     elif mutation == "factor":
         adj["factor"] = 1.1
-    elif mutation == "invention":
-        adj["factor"] = 0.6
-    elif mutation == "time":
-        adj["hours"] = [13, 14, 15]
-    elif mutation == "quote":
-        raw["entries"][0]["evidence"]["time_text"] = "12 PM to 2 PM"
-    elif mutation == "polarity":
-        adj["factor"] = 0.8
-        raw["entries"][0]["evidence"]["value_kind"] = "remaining_fraction"
     with pytest.raises(InterpretationError):
         validate_model_output(OptimizeRequest.model_validate(base_request), raw)
 
@@ -124,7 +58,7 @@ def test_invalid_model_data(base_request, mutation):
 def test_noop_semantics(base_request):
     raw = model_output(base_request, [directive()])
     assert validate_model_output(OptimizeRequest.model_validate(base_request), raw)[0].applies is False
-    raw["entries"][0]["interpretation"]["structured_adjustment"] = {"hours": [1]}
+    raw["entries"][0]["structured_adjustment"] = {"hours": [1]}
     with pytest.raises(InterpretationError):
         validate_model_output(OptimizeRequest.model_validate(base_request), raw)
 
@@ -135,6 +69,63 @@ def test_reserve_percent_and_capacity(base_request):
     request = OptimizeRequest.model_validate(base_request)
     validate_model_output(request, raw)
     invalid = copy.deepcopy(raw)
-    invalid["entries"][0]["interpretation"]["structured_adjustment"]["minimum_energy_kwh"] = 100
+    invalid["entries"][0]["structured_adjustment"]["minimum_energy_kwh"] = 100
     with pytest.raises(InterpretationError):
         validate_model_output(request, invalid)
+
+
+@pytest.mark.parametrize(
+    "note",
+    [
+        "দুপুর একটা থেকে তিনটা চার্জ বন্ধ রাখুন।",
+        "No cargar entre la una y las tres.",
+        "午後一時から三時まで充電しないでください。",
+        "Unfamiliar phrasing understood by the model",
+    ],
+)
+def test_language_is_model_responsibility(base_request, note):
+    base_request["operator_notes"] = [note]
+    raw = model_output(base_request, [directive("no_charge_window", [13, 14])])
+    result = validate_model_output(OptimizeRequest.model_validate(base_request), raw)
+    assert result[0].structured_adjustment.hours == [13, 14]
+
+
+@pytest.mark.parametrize(
+    "kind,field,value",
+    [
+        ("solar_reduction", "factor", float("nan")),
+        ("solar_reduction", "factor", -0.1),
+        ("minimum_battery_reserve", "minimum_energy_kwh", -1),
+        ("minimum_battery_reserve", "minimum_energy_kwh", float("inf")),
+        ("max_grid_window", "max_grid_kwh", -1),
+        ("max_grid_window", "max_grid_kwh", float("inf")),
+    ],
+)
+def test_finite_numeric_bounds(base_request, kind, field, value):
+    raw = model_output(base_request, [directive(kind, [0, 23], value)])
+    with pytest.raises(InterpretationError):
+        validate_model_output(OptimizeRequest.model_validate(base_request), raw)
+
+
+@pytest.mark.parametrize(
+    "kind", ["solar_reduction", "minimum_battery_reserve", "max_grid_window", "no_charge_window", "no_discharge_window"]
+)
+def test_required_shape_and_no_scenario_mutations(base_request, kind):
+    raw = model_output(base_request, [directive(kind, [0, 23], 0)])
+    request = OptimizeRequest.model_validate(base_request)
+    validate_model_output(request, raw)
+    raw["entries"][0]["structured_adjustment"] = None
+    with pytest.raises(InterpretationError):
+        validate_model_output(request, raw)
+    raw = model_output(base_request, [directive(kind, [0], 0)])
+    raw["battery"] = {"capacity_kwh": 1000}
+    with pytest.raises(InterpretationError):
+        validate_model_output(request, raw)
+
+
+def test_note_order_and_coverage(base_request):
+    base_request["operator_notes"] *= 2
+    request = OptimizeRequest.model_validate(base_request)
+    for entries in ([directive(), directive()], [directive(index=1), directive()], [directive()]):
+        with pytest.raises(InterpretationError):
+            validate_model_output(request, {"entries": entries})
